@@ -1174,7 +1174,10 @@ fn transStmt(t: *Translator, scope: *Scope, stmt: NodeIndex) TransError!ZigNode 
             return ZigTag.declaration.init();
         },
         .return_stmt => return t.transReturnStmt(scope, stmt),
+        .implicit_return => return ZigTag.@"return".create(t.arena, ZigTag.zero_literal.init()),
         .null_stmt => return ZigTag.empty_block.init(),
+        .if_then_stmt => return t.transIfThenStmt(scope, stmt),
+        .if_then_else_stmt => return t.transIfThenElseStmt(scope, stmt),
         else => |tag| return t.fail(error.UnsupportedTranslation, t.nodeLoc(stmt), "TODO implement translation of stmt {s}", .{@tagName(tag)}),
     }
 }
@@ -1207,6 +1210,34 @@ fn transReturnStmt(t: *Translator, scope: *Scope, return_stmt: NodeIndex) TransE
         rhs = try ZigTag.int_from_bool.create(t.arena, rhs);
     }
     return ZigTag.@"return".create(t.arena, rhs);
+}
+
+fn transIfThenStmt(t: *Translator, scope: *Scope, if_then_stmt: NodeIndex) TransError!ZigNode {
+    const bin = t.nodeData(if_then_stmt).bin;
+
+    const cond = try t.transExprCoercing(scope, bin.lhs);
+    const then = try t.transStmt(scope, bin.rhs);
+
+    return ZigTag.@"if".create(t.arena, .{
+        .cond = cond,
+        .then = then,
+        .@"else" = null,
+    });
+}
+
+fn transIfThenElseStmt(t: *Translator, scope: *Scope, if_then_else_stmt: NodeIndex) TransError!ZigNode {
+    const if3 = t.nodeData(if_then_else_stmt).if3;
+    const data = t.tree.data[if3.body..];
+
+    const cond = try t.transExprCoercing(scope, if3.cond);
+    const then = try t.transStmt(scope, data[0]);
+    const @"else" = try t.transStmt(scope, data[1]);
+
+    return ZigTag.@"if".create(t.arena, .{
+        .cond = cond,
+        .then = then,
+        .@"else" = @"else",
+    });
 }
 
 // ======================
