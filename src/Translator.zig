@@ -307,7 +307,7 @@ fn transDecl(t: *Translator, scope: *Scope, decl: NodeIndex) !void {
         .threadlocal_extern_var,
         .threadlocal_static_var,
         => {
-            try t.transVarDecl(decl);
+            try t.transVarDecl(scope, decl);
         },
         .static_assert => {
             try t.transStaticAssert(&t.global_scope.base, decl);
@@ -605,10 +605,59 @@ fn transFnDecl(t: *Translator, fn_decl_node: NodeIndex, is_pub: bool) Error!void
     return t.addTopLevelDecl(fn_name, proto_node);
 }
 
-fn transVarDecl(t: *Translator, node: NodeIndex) Error!void {
+fn transVarDecl(t: *Translator, scope: *Scope, node: NodeIndex) Error!void {
     const decl = t.nodeData(node).decl;
     const name = t.tree.tokSlice(decl.name);
-    return t.failDecl(decl.name, name, "unable to translate variable declaration", .{});
+
+    const toplevel = scope.id == .root;
+    const bs: *Scope.Block = if (!toplevel) try scope.findBlockScope(t) else undefined;
+
+    const ty = t.nodeType(node).canonicalize(.standard);
+
+    const var_type = t.transType(scope, t.nodeType(node), .standard, undefined) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.UnsupportedType,
+        => {
+            return t.failDecl(decl.name, name, "unable to translate variable declaration's type", .{});
+        },
+    };
+
+    const typedef_loc = decl.name;
+    const init_node = if (decl.node == .none)
+        ZigTag.undefined_literal.init()
+    else
+        t.transExprCoercing(scope, decl.node) catch |err| switch (err) {
+            error.UnsupportedTranslation, error.UnsupportedType => {
+                return t.failDecl(typedef_loc, name, "unable to resolve var init expr", .{});
+            },
+            error.OutOfMemory => |e| return e,
+        };
+
+    const payload = try t.arena.create(ast.Payload.VarDecl);
+    payload.* = .{
+        .base = .{ .tag = ZigTag.var_decl },
+        .data = .{
+            .is_pub = false,
+            .is_const = ty.qual.@"const",
+            .is_extern = false,
+            .is_export = false,
+            .is_threadlocal = false,
+            .alignment = null,
+            .linksection_string = null,
+            .name = name,
+            .type = var_type,
+            .init = init_node,
+        },
+    };
+    const node2 = ZigNode.initPayload(&payload.base);
+    if (toplevel) {
+        try t.addTopLevelDecl(name, node2);
+    } else {
+        try scope.appendNode(node2);
+        if (node2.tag() != .pub_var_simple) {
+            try bs.discardVariable(name);
+        }
+    }
 }
 
 fn transEnumDecl(t: *Translator, scope: *Scope, enum_decl: *const Type.Enum, field_nodes: []const NodeIndex, source_loc: ?TokenIndex) Error!void {
@@ -748,7 +797,7 @@ fn transType(t: *Translator, scope: *Scope, raw_ty: Type, qual_handling: Type.Qu
     switch (ty.specifier) {
         .void => return ZigTag.type.create(t.arena, "anyopaque"),
         .bool => return ZigTag.type.create(t.arena, "bool"),
-        .char => return ZigTag.type.create(t.arena, "c_char"),
+        .char => return ZigTag.type.create(t.arena, "u8"),
         .schar => return ZigTag.type.create(t.arena, "i8"),
         .uchar => return ZigTag.type.create(t.arena, "u8"),
         .short => return ZigTag.type.create(t.arena, "c_short"),
@@ -1174,10 +1223,11 @@ fn transStmt(t: *Translator, scope: *Scope, stmt: NodeIndex) TransError!ZigNode 
             return ZigTag.declaration.init();
         },
         .return_stmt => return t.transReturnStmt(scope, stmt),
-        .implicit_return => return ZigTag.@"return".create(t.arena, ZigTag.zero_literal.init()),
+        .implicit_return => return t.transImplicitReturnStmt(scope, stmt),
         .null_stmt => return ZigTag.empty_block.init(),
         .if_then_stmt => return t.transIfThenStmt(scope, stmt),
         .if_then_else_stmt => return t.transIfThenElseStmt(scope, stmt),
+        .@"var" => return t.transVarStmt(scope, stmt),
         else => |tag| return t.fail(error.UnsupportedTranslation, t.nodeLoc(stmt), "TODO implement translation of stmt {s}", .{@tagName(tag)}),
     }
 }
@@ -1212,6 +1262,24 @@ fn transReturnStmt(t: *Translator, scope: *Scope, return_stmt: NodeIndex) TransE
     return ZigTag.@"return".create(t.arena, rhs);
 }
 
+fn transImplicitReturnStmt(t: *Translator, scope: *Scope, implicit_return_stmt: NodeIndex) TransError!ZigNode {
+    const return_zero = t.nodeData(implicit_return_stmt).return_zero;
+    if (return_zero) {
+        return ZigTag.@"return".create(t.arena, ZigTag.zero_literal.init());
+    }
+
+    const bs = try scope.findBlockScope(t);
+    if (bs.return_type) |return_type| {
+        const ty = return_type.canonicalize(.standard);
+        if (ty.specifier == .void) return ZigTag.empty_block.init();
+
+        const implicit_value = try t.transZeroInitExpr(return_type, .standard);
+        return ZigTag.@"return".create(t.arena, implicit_value);
+    }
+
+    return error.UnsupportedTranslation;
+}
+
 fn transIfThenStmt(t: *Translator, scope: *Scope, if_then_stmt: NodeIndex) TransError!ZigNode {
     const bin = t.nodeData(if_then_stmt).bin;
 
@@ -1240,6 +1308,11 @@ fn transIfThenElseStmt(t: *Translator, scope: *Scope, if_then_else_stmt: NodeInd
     });
 }
 
+fn transVarStmt(t: *Translator, scope: *Scope, var_stmt: NodeIndex) TransError!ZigNode {
+    try t.transDecl(scope, var_stmt);
+    return ZigTag.declaration.init();
+}
+
 // ======================
 // Expression translation
 // ======================
@@ -1250,11 +1323,7 @@ fn transExpr(t: *Translator, scope: *Scope, expr: NodeIndex, used: ResultUsed) T
     if (t.tree.value_map.get(expr)) |val| {
         // TODO handle other values
         const int = try t.transCreateNodeInt(val);
-        const as_node = try ZigTag.as.create(t.arena, .{
-            .lhs = try t.transType(undefined, ty, .standard, undefined),
-            .rhs = int,
-        });
-        return t.maybeSuppressResult(used, as_node);
+        return t.maybeSuppressResult(used, int);
     }
     return t.maybeSuppressResult(used, switch (t.nodeTag(expr)) {
         .paren_expr => {
@@ -1391,7 +1460,43 @@ fn transExpr(t: *Translator, scope: *Scope, expr: NodeIndex, used: ResultUsed) T
 /// Same as `transExpr` but with the knowledge that the operand will be type coerced, and therefore
 /// an `@as` would be redundant. This is used to prevent redundant `@as` in integer literals.
 fn transExprCoercing(t: *Translator, scope: *Scope, expr: NodeIndex) TransError!ZigNode {
-    // TODO bypass casts
+    // TODO: does used need to be a param?
+    const used: ResultUsed = .used;
+
+    std.debug.assert(expr != .none);
+    const ty = t.nodeType(expr);
+    switch (t.nodeTag(expr)) {
+        .implicit_cast => {
+            const cast = t.nodeData(expr).cast;
+
+            switch (cast.kind) {
+                .int_to_float => return t.transExprCoercing(scope, cast.operand),
+                .int_cast => {
+                    if (t.tree.value_map.get(expr)) |val| {
+                        const operand_expr = try t.transExprCoercing(scope, cast.operand);
+
+                        const max_int = try aro.Value.maxInt(ty, t.comp);
+
+                        // TODO: can/should this be done with interner?
+                        if (t.nodeType(expr).specifier == .char) {
+                            if (val.compare(.lte, max_int, t.comp)) {
+                                return operand_expr;
+                            }
+                        } else {
+                            if (val.compare(.lte, max_int, t.comp)) {
+                                return t.transCreateNodeInt(val);
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+
+            return t.maybeSuppressResult(used, try t.transCastExpr(scope, expr, used));
+        },
+        else => {},
+    }
+
     return t.transExpr(scope, expr, .used);
 }
 
@@ -1447,6 +1552,28 @@ fn transCastExpr(t: *Translator, scope: *Scope, cast_node: NodeIndex, used: Resu
         .lval_to_rval, .no_op, .function_to_pointer => {
             const sub_expr_node = try t.transExpr(scope, cast.operand, .used);
             return t.maybeSuppressResult(used, sub_expr_node);
+        },
+        .int_cast => {
+            const dest_ty = t.nodeType(cast_node);
+            const src_ty = t.nodeType(cast.operand);
+
+            const operand_expr = try t.transExprCoercing(scope, cast.operand);
+
+            const needs_truncate = src_ty.compareIntegerRanks(dest_ty, t.comp).compare(.gt);
+            const needs_bitcast = src_ty.signedness(t.comp) != dest_ty.signedness(t.comp);
+            if (needs_truncate and needs_bitcast) {
+                const as = try ZigTag.as.create(t.arena, .{
+                    .lhs = try t.transTypeIntWidthOf(dest_ty, src_ty.signedness(t.comp) == .signed),
+                    .rhs = try ZigTag.truncate.create(t.arena, operand_expr),
+                });
+                return try ZigTag.bit_cast.create(t.arena, as);
+            } else if (needs_truncate) {
+                return try ZigTag.truncate.create(t.arena, operand_expr);
+            } else if (needs_bitcast) {
+                return try ZigTag.bit_cast.create(t.arena, operand_expr);
+            }
+
+            return operand_expr;
         },
         .to_void => {
             return t.transExpr(scope, cast.operand, used);
@@ -1628,7 +1755,7 @@ fn transBuiltinCall(
             const ptr = try t.arena.create(ast.Payload.UnOp);
             ptr.* = .{
                 .base = .{ .tag = tag },
-                .data = try t.transExpr(scope, arg_nodes[0], .used),
+                .data = try t.transExprCoercing(scope, arg_nodes[0]),
             };
             return ZigNode.initPayload(&ptr.base);
         },
@@ -1689,6 +1816,21 @@ fn transCreateNodeInfixOp(
         },
     };
     return ZigNode.initPayload(&payload.base);
+}
+
+fn transZeroInitExpr(t: *Translator, raw_ty: Type, qual_handling: Type.QualHandling) TransError!ZigNode {
+    const ty = raw_ty.canonicalize(qual_handling);
+    if (ty.qual.atomic) {
+        const type_name = try t.getTypeStr(ty);
+        return t.fail(error.UnsupportedType, undefined, "unsupported type: '{s}'", .{type_name});
+    }
+
+    if (ty.specifier == .bool) return ZigTag.false_literal.init();
+    if (ty.isInt() and ty.isReal()) return ZigTag.zero_literal.init();
+    if (ty.isFloat() and ty.isReal()) return ZigTag.zero_literal.init();
+    if (ty.isPtr()) return ZigTag.null_literal.init();
+
+    return error.UnsupportedType;
 }
 
 /// Cast a signed integer node to a usize, for use in pointer arithmetic. Negative numbers
