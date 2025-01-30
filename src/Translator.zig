@@ -1578,6 +1578,23 @@ fn transCastExpr(t: *Translator, scope: *Scope, cast_node: NodeIndex, used: Resu
         .to_void => {
             return t.transExpr(scope, cast.operand, used);
         },
+        .array_to_pointer => {
+            // TODO handle other values
+            if (t.tree.value_map.get(cast_node)) |val| {
+                const str_ty = t.nodeType(cast_node);
+
+                const bytes = t.comp.interner.get(val.ref()).bytes;
+                var buf = std.ArrayList(u8).init(t.gpa);
+                defer buf.deinit();
+
+                try buf.ensureUnusedCapacity(bytes.len);
+                try aro.Value.printString(bytes, str_ty, t.comp, buf.writer());
+
+                return try ZigTag.string_literal.create(t.arena, try t.arena.dupe(u8, buf.items));
+            }
+
+            return t.fail(error.UnsupportedTranslation, t.nodeLoc(cast_node), "TODO translate {s} cast", .{@tagName(cast.kind)});
+        },
         else => return t.fail(error.UnsupportedTranslation, t.nodeLoc(cast_node), "TODO translate {s} cast", .{@tagName(cast.kind)}),
     }
 }
