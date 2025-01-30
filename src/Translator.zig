@@ -1453,6 +1453,7 @@ fn transExpr(t: *Translator, scope: *Scope, expr: NodeIndex, used: ResultUsed) T
 
         .builtin_call_expr => return t.transBuiltinCall(scope, expr, used),
         .builtin_call_expr_one => return t.transBuiltinCall(scope, expr, used),
+        .cond_expr => return t.transCondExpr(scope, expr),
         else => unreachable, // Not an expression.
     });
 }
@@ -1674,6 +1675,23 @@ fn transShiftExpr(t: *Translator, scope: *Scope, bin_node: NodeIndex, op_id: Zig
     const rhs_casted = try ZigTag.int_cast.create(t.arena, rhs);
 
     return t.transCreateNodeInfixOp(op_id, lhs, rhs_casted);
+}
+
+fn transCondExpr(t: *Translator, scope: *Scope, cond_node: NodeIndex) TransError!ZigNode {
+    const if3 = t.nodeData(cond_node).if3;
+    const data = t.tree.data[if3.body..];
+
+    const cond = try t.transExprCoercing(scope, if3.cond);
+    const then = try t.transExprCoercing(scope, data[0]);
+    const @"else" = try t.transExprCoercing(scope, data[1]);
+
+    // TODO: is int_from_bool needed?
+
+    return ZigTag.@"if".create(t.arena, .{
+        .cond = cond,
+        .then = then,
+        .@"else" = @"else",
+    });
 }
 
 fn transPtrDiffExpr(t: *Translator, scope: *Scope, bin_node: NodeIndex) TransError!ZigNode {
