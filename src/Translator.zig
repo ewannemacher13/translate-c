@@ -626,7 +626,7 @@ fn transVarDecl(t: *Translator, scope: *Scope, node: NodeIndex) Error!void {
     const init_node = if (decl.node == .none)
         ZigTag.undefined_literal.init()
     else
-        t.transExprCoercing(scope, decl.node) catch |err| switch (err) {
+        t.transExprCoercing(scope, decl.node, .used) catch |err| switch (err) {
             error.UnsupportedTranslation, error.UnsupportedType => {
                 return t.failDecl(typedef_loc, name, "unable to resolve var init expr", .{});
             },
@@ -1228,7 +1228,10 @@ fn transStmt(t: *Translator, scope: *Scope, stmt: NodeIndex) TransError!ZigNode 
         .if_then_stmt => return t.transIfThenStmt(scope, stmt),
         .if_then_else_stmt => return t.transIfThenElseStmt(scope, stmt),
         .@"var" => return t.transVarStmt(scope, stmt),
-        else => |tag| return t.fail(error.UnsupportedTranslation, t.nodeLoc(stmt), "TODO implement translation of stmt {s}", .{@tagName(tag)}),
+        //else => |tag| return t.fail(error.UnsupportedTranslation, t.nodeLoc(stmt), "TODO implement translation of stmt {s}", .{@tagName(tag)}),
+
+        //TODO: is there a nice way to check if the tag is an expression?
+        else => return t.transExprCoercing(scope, stmt, .unused),
     }
 }
 
@@ -1254,7 +1257,7 @@ fn transReturnStmt(t: *Translator, scope: *Scope, return_stmt: NodeIndex) TransE
     const operand = t.nodeData(return_stmt).un;
     if (operand == .none) return ZigTag.return_void.init();
 
-    var rhs = try t.transExprCoercing(scope, operand);
+    var rhs = try t.transExprCoercing(scope, operand, .used);
     const return_ty = scope.findBlockReturnType();
     if (rhs.isBoolRes() and !return_ty.is(.bool)) {
         rhs = try ZigTag.int_from_bool.create(t.arena, rhs);
@@ -1450,6 +1453,27 @@ fn transExpr(t: *Translator, scope: *Scope, expr: NodeIndex, used: ResultUsed) T
         .builtin_call_expr_one => return t.transBuiltinCall(scope, expr, used),
         .cond_expr => return t.transCondExpr(scope, expr),
         .comma_expr => try t.transCommaExpr(scope, expr),
+        .assign_expr => {
+            const bin = t.nodeData(expr).bin;
+            return try t.transCreateNodeAssign(scope, used, bin.lhs, bin.rhs);
+        },
+        .int_literal => res: {
+            const val = t.tree.value_map.get(expr).?;
+            break :res try t.transCreateNodeInt(val);
+        },
+        .string_literal_expr => res: {
+            const val = t.tree.value_map.get(expr).?;
+            const str_ty = t.nodeType(expr);
+
+            const bytes = t.comp.interner.get(val.ref()).bytes;
+            var buf = std.ArrayList(u8).init(t.gpa);
+            defer buf.deinit();
+
+            try buf.ensureUnusedCapacity(bytes.len);
+            try aro.Value.printString(bytes, str_ty, t.comp, buf.writer());
+
+            break :res try ZigTag.string_literal.create(t.arena, try t.arena.dupe(u8, buf.items));
+        },
         else => {
             if (t.tree.value_map.get(expr)) |val| {
                 // TODO handle other values
@@ -1463,10 +1487,7 @@ fn transExpr(t: *Translator, scope: *Scope, expr: NodeIndex, used: ResultUsed) T
 
 /// Same as `transExpr` but with the knowledge that the operand will be type coerced, and therefore
 /// an `@as` would be redundant. This is used to prevent redundant `@as` in integer literals.
-fn transExprCoercing(t: *Translator, scope: *Scope, expr: NodeIndex) TransError!ZigNode {
-    // TODO: does used need to be a param?
-    const used: ResultUsed = .used;
-
+fn transExprCoercing(t: *Translator, scope: *Scope, expr: NodeIndex, used: ResultUsed) TransError!ZigNode {
     std.debug.assert(expr != .none);
     const ty = t.nodeType(expr);
     switch (t.nodeTag(expr)) {
@@ -1474,10 +1495,10 @@ fn transExprCoercing(t: *Translator, scope: *Scope, expr: NodeIndex) TransError!
             const cast = t.nodeData(expr).cast;
 
             switch (cast.kind) {
-                .int_to_float => return t.transExprCoercing(scope, cast.operand),
+                .int_to_float => return t.transExprCoercing(scope, cast.operand, used),
                 .int_cast => {
                     if (t.tree.value_map.get(expr)) |val| {
-                        const operand_expr = try t.transExprCoercing(scope, cast.operand);
+                        const operand_expr = try t.transExprCoercing(scope, cast.operand, used);
 
                         const max_int = try aro.Value.maxInt(ty, t.comp);
 
@@ -1501,7 +1522,7 @@ fn transExprCoercing(t: *Translator, scope: *Scope, expr: NodeIndex) TransError!
         else => {},
     }
 
-    return t.transExpr(scope, expr, .used);
+    return t.transExpr(scope, expr, used);
 }
 
 fn transBoolExpr(t: *Translator, scope: *Scope, expr: NodeIndex) TransError!ZigNode {
@@ -1561,7 +1582,7 @@ fn transCastExpr(t: *Translator, scope: *Scope, cast_node: NodeIndex, used: Resu
             const dest_ty = t.nodeType(cast_node);
             const src_ty = t.nodeType(cast.operand);
 
-            const operand_expr = try t.transExprCoercing(scope, cast.operand);
+            const operand_expr = try t.transExprCoercing(scope, cast.operand, used);
 
             const needs_truncate = src_ty.compareIntegerRanks(dest_ty, t.comp).compare(.gt);
             const needs_bitcast = src_ty.signedness(t.comp) != dest_ty.signedness(t.comp);
@@ -1674,7 +1695,7 @@ fn transShiftExpr(t: *Translator, scope: *Scope, bin_node: NodeIndex, op_id: Zig
     // lhs >> @intCast(rh)
     const lhs = try t.transExpr(scope, bin.lhs, .used);
 
-    const rhs = try t.transExprCoercing(scope, bin.rhs);
+    const rhs = try t.transExprCoercing(scope, bin.rhs, .used);
     const rhs_casted = try ZigTag.int_cast.create(t.arena, rhs);
 
     return t.transCreateNodeInfixOp(op_id, lhs, rhs_casted);
@@ -1685,8 +1706,8 @@ fn transCondExpr(t: *Translator, scope: *Scope, cond_node: NodeIndex) TransError
     const data = t.tree.data[if3.body..];
 
     const cond = try t.transBoolExpr(scope, if3.cond);
-    const then = try t.transExprCoercing(scope, data[0]);
-    const @"else" = try t.transExprCoercing(scope, data[1]);
+    const then = try t.transExprCoercing(scope, data[0], .used);
+    const @"else" = try t.transExprCoercing(scope, data[1], .used);
 
     // TODO: is int_from_bool needed?
 
@@ -1703,10 +1724,10 @@ fn transCommaExpr(t: *Translator, scope: *Scope, comma_node: NodeIndex) TransErr
     var block_scope = try Scope.Block.init(t, scope, true);
     defer block_scope.deinit();
 
-    const lhs = try t.maybeSuppressResult(.unused, try t.transExprCoercing(&block_scope.base, bin.lhs));
+    const lhs = try t.transExprCoercing(&block_scope.base, bin.lhs, .unused);
     try block_scope.statements.append(t.gpa, lhs);
 
-    const rhs = try t.transExprCoercing(&block_scope.base, bin.rhs);
+    const rhs = try t.transExprCoercing(&block_scope.base, bin.rhs, .used);
     const break_node = try ZigTag.break_val.create(t.arena, .{
         .label = block_scope.label,
         .val = rhs,
@@ -1812,7 +1833,7 @@ fn transBuiltinCall(
             const ptr = try t.arena.create(ast.Payload.UnOp);
             ptr.* = .{
                 .base = .{ .tag = tag },
-                .data = try t.transExprCoercing(scope, arg_nodes[0]),
+                .data = try t.transExprCoercing(scope, arg_nodes[0], used),
             };
             return ZigNode.initPayload(&ptr.base);
         },
@@ -1829,7 +1850,7 @@ fn transBuiltinCall(
 
     const args = try t.arena.alloc(ZigNode, arg_nodes.len);
     for (arg_nodes, args) |arg_node, *arg| {
-        arg.* = try t.transExprCoercing(scope, arg_node);
+        arg.* = try t.transExprCoercing(scope, arg_node, used);
     }
 
     const res = try ZigTag.call.create(t.arena, .{
@@ -1856,6 +1877,29 @@ fn transCreateNodeInt(t: *Translator, int: aro.Value) !ZigNode {
     const res = try ZigTag.integer_literal.create(t.arena, str);
     if (is_negative) return ZigTag.negate.create(t.arena, res);
     return res;
+}
+
+fn transCreateNodeAssign(
+    t: *Translator,
+    scope: *Scope,
+    used: ResultUsed,
+    lhs: NodeIndex,
+    rhs: NodeIndex,
+) !ZigNode {
+    if (used == .unused) {
+        const lhs_node = try t.transExpr(scope, lhs, .used);
+        var rhs_node = try t.transExprCoercing(scope, rhs, .used);
+
+        const lhs_ty = t.nodeType(lhs);
+
+        if (rhs_node.isBoolRes() and !lhs_ty.is(.bool)) {
+            rhs_node = try ZigTag.int_from_bool.create(t.arena, rhs_node);
+        }
+
+        return t.transCreateNodeInfixOp(.assign, lhs_node, rhs_node);
+    }
+
+    return t.fail(error.UnsupportedTranslation, undefined, "TODO implement translation of .used assignment", .{});
 }
 
 fn transCreateNodeInfixOp(
