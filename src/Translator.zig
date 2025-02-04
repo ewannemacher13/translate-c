@@ -1283,7 +1283,7 @@ fn transImplicitReturnStmt(t: *Translator, scope: *Scope, implicit_return_stmt: 
 fn transIfThenStmt(t: *Translator, scope: *Scope, if_then_stmt: NodeIndex) TransError!ZigNode {
     const bin = t.nodeData(if_then_stmt).bin;
 
-    const cond = try t.transExprCoercing(scope, bin.lhs);
+    const cond = try t.transBoolExpr(scope, bin.lhs);
     const then = try t.transStmt(scope, bin.rhs);
 
     return ZigTag.@"if".create(t.arena, .{
@@ -1297,7 +1297,7 @@ fn transIfThenElseStmt(t: *Translator, scope: *Scope, if_then_else_stmt: NodeInd
     const if3 = t.nodeData(if_then_else_stmt).if3;
     const data = t.tree.data[if3.body..];
 
-    const cond = try t.transExprCoercing(scope, if3.cond);
+    const cond = try t.transBoolExpr(scope, if3.cond);
     const then = try t.transStmt(scope, data[0]);
     const @"else" = try t.transStmt(scope, data[1]);
 
@@ -1320,11 +1320,6 @@ fn transVarStmt(t: *Translator, scope: *Scope, var_stmt: NodeIndex) TransError!Z
 fn transExpr(t: *Translator, scope: *Scope, expr: NodeIndex, used: ResultUsed) TransError!ZigNode {
     std.debug.assert(expr != .none);
     const ty = t.nodeType(expr);
-    if (t.tree.value_map.get(expr)) |val| {
-        // TODO handle other values
-        const int = try t.transCreateNodeInt(val);
-        return t.maybeSuppressResult(used, int);
-    }
     return t.maybeSuppressResult(used, switch (t.nodeTag(expr)) {
         .paren_expr => {
             const operand = t.nodeData(expr).un;
@@ -1454,7 +1449,15 @@ fn transExpr(t: *Translator, scope: *Scope, expr: NodeIndex, used: ResultUsed) T
         .builtin_call_expr => return t.transBuiltinCall(scope, expr, used),
         .builtin_call_expr_one => return t.transBuiltinCall(scope, expr, used),
         .cond_expr => return t.transCondExpr(scope, expr),
-        else => unreachable, // Not an expression.
+        .comma_expr => try t.transCommaExpr(scope, expr),
+        else => {
+            if (t.tree.value_map.get(expr)) |val| {
+                // TODO handle other values
+                const int = try t.transCreateNodeInt(val);
+                return t.maybeSuppressResult(used, int);
+            }
+            unreachable; // Not an expression.
+        },
     });
 }
 
@@ -1681,7 +1684,7 @@ fn transCondExpr(t: *Translator, scope: *Scope, cond_node: NodeIndex) TransError
     const if3 = t.nodeData(cond_node).if3;
     const data = t.tree.data[if3.body..];
 
-    const cond = try t.transExprCoercing(scope, if3.cond);
+    const cond = try t.transBoolExpr(scope, if3.cond);
     const then = try t.transExprCoercing(scope, data[0]);
     const @"else" = try t.transExprCoercing(scope, data[1]);
 
@@ -1692,6 +1695,25 @@ fn transCondExpr(t: *Translator, scope: *Scope, cond_node: NodeIndex) TransError
         .then = then,
         .@"else" = @"else",
     });
+}
+
+fn transCommaExpr(t: *Translator, scope: *Scope, comma_node: NodeIndex) TransError!ZigNode {
+    const bin = t.nodeData(comma_node).bin;
+
+    var block_scope = try Scope.Block.init(t, scope, true);
+    defer block_scope.deinit();
+
+    const lhs = try t.maybeSuppressResult(.unused, try t.transExprCoercing(&block_scope.base, bin.lhs));
+    try block_scope.statements.append(t.gpa, lhs);
+
+    const rhs = try t.transExprCoercing(&block_scope.base, bin.rhs);
+    const break_node = try ZigTag.break_val.create(t.arena, .{
+        .label = block_scope.label,
+        .val = rhs,
+    });
+    try block_scope.statements.append(t.gpa, break_node);
+
+    return try block_scope.complete();
 }
 
 fn transPtrDiffExpr(t: *Translator, scope: *Scope, bin_node: NodeIndex) TransError!ZigNode {
@@ -1807,7 +1829,7 @@ fn transBuiltinCall(
 
     const args = try t.arena.alloc(ZigNode, arg_nodes.len);
     for (arg_nodes, args) |arg_node, *arg| {
-        arg.* = try t.transExpr(scope, arg_node, .used);
+        arg.* = try t.transExprCoercing(scope, arg_node);
     }
 
     const res = try ZigTag.call.create(t.arena, .{
